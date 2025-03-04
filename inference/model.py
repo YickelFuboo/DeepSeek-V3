@@ -148,14 +148,18 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
         - If `gemm_impl == "bf16"`, dequantization and a `bf16` GEMM operation are applied.
         - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
     """
+    # 权重参数单元大小>8bit，直接服用pytorch原始的linear操作
     if weight.element_size() > 1:
         return F.linear(x, weight, bias)
     elif gemm_impl == "bf16":
         weight = weight_dequant(weight, weight.scale)
         return F.linear(x, weight, bias)
-    else:
+    else: # FP8线性变化操作
+        # block_size = 128，为FP8量化的分块大小，这里进行的是FP8量化操作
         x, scale = act_quant(x, block_size)
+        # 现象变化操作
         y = fp8_gemm(x, scale, weight, weight.scale)
+        # 加偏置参数
         if bias is not None:
             y += bias
         return y
@@ -175,15 +179,21 @@ class Linear(nn.Module):
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False, dtype = None):
         super().__init__()
+        # 线性变化输入维度
         self.in_features = in_features
+        # 线性变化输出维度
         self.out_features = out_features
+        # 初始化一个未初始化的W权重参数矩阵，形状为out_features*in_features，数据类型为dtype
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+        # 对FP8的处理。size=1表示8大小是8bit位。block_size是FP8量化的分块大小。
+        # 如果是W是量化过的，需要引入缩放因子scale，来保存量化前的权重信息。
         if self.weight.element_size() == 1:
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
             self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32))
         else:
             self.register_parameter("scale", None)
+        # 初始化偏置参数
         if bias:
             self.bias = nn.Parameter(torch.empty(self.part_out_features))
         else:
@@ -459,12 +469,15 @@ class MLA(nn.Module):
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
+
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
+
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+
         if attn_impl == "naive":
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(self.kv_norm(kv))
@@ -658,7 +671,9 @@ class MoE(nn.Module):
         self.n_activated_experts = args.n_activated_experts
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        # 定义门控网络
         self.gate = Gate(args)
+        # 定义本进程的Expert专家列表
         self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
                                       for i in range(self.n_routed_experts)])
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
@@ -676,7 +691,9 @@ class MoE(nn.Module):
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x)
+
         y = torch.zeros_like(x)
+        # 门控网络选择专家
         counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
         for i in range(self.experts_start_idx, self.experts_end_idx):
             if counts[i] == 0:
@@ -751,16 +768,22 @@ class Transformer(nn.Module):
         Args:
             args (ModelArgs): Model arguments containing transformer parameters.
         """
+        # word_size和rank是全局变量，用于分布式训练。
+        # world_size是进程数，表示参与分布式训练的进程总数，每个进程可以看作是分布式系统中的一个节点。
+        # rank表示当前进程在整个分布式系统中的唯一标识符（编号），范围是从 0 到 world_size - 1。
         global world_size, rank
         world_size = dist.get_world_size() if dist.is_initialized() else 1
         rank = dist.get_rank() if dist.is_initialized() else 0
+
         Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         super().__init__()
         self.max_seq_len = args.max_seq_len
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)
         self.layers = torch.nn.ModuleList()
+        # 初始化定义多层数、及每一层的Attention、FFN、RMSNorm相关操作
         for layer_id in range(args.n_layers):
             self.layers.append(Block(layer_id, args))
+        # 定义Transformer各层执行后的最后一层归一化处理逻辑
         self.norm = RMSNorm(args.dim)
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
@@ -777,16 +800,30 @@ class Transformer(nn.Module):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
+        # 批量训练。tokens的第一维是batch_size，第二维度是seq_len，这里seqlen获取第二维的大小。
         seqlen = tokens.size(1)
+        # 将tokens转换为嵌入表示 h，形状为 (batch_size, seq_len, dim)，其中 dim 是模型的维度。
         h = self.embed(tokens)
+        # 从预计算的旋转位置编码张量 self.freqs_cis 中提取当前序列所需的部分，形状为 (seqlen, dim // 2)
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+
+        # 如果序列长度大于1，则创建一个上三角矩阵作为掩码，形状为 (seqlen, seqlen)，用于防止自注意力机制关注未来的位置。
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+
+        # 遍历所有 Transformer 层，逐层处理嵌入表示 h。每一层接收当前隐藏状态、起始位置、旋转位置编码和掩码，并返回更新后的隐藏状态。
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
+
+        # 使用 self.norm 对最终的隐藏状态进行归一化。
         h = self.norm(h)[:, -1]
+
+        # 使用 self.head 将归一化后的隐藏状态映射到词汇表大小的 logits，形状为 (batch_size, vocab_size)。
+        # 为啥第二维是vocab_size呢？因为head是一个线性层，输入是dim，输出是vocab_size。里面存储是的什么东西呢，就是vocab_size个权重。
         logits = self.head(h)
+
+        # 如果使用分布式训练（world_size > 1），则将所有进程的 logits 收集并拼接在一起，确保最终的 logits 包含完整的词汇表信息。
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)

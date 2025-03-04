@@ -20,10 +20,13 @@ def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     Returns:
         None
     """
+    # 注意，y的形状与x相同，s的形状是最后一维大小=x的最后一维大小/block_size
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offs).to(tl.float32)
+    # 缩放因子：从block_size大小内容中找最大值，然后/448缩放（448是FP8可表示的最大值）
     s = tl.max(tl.abs(x)) / 448.
+    # x基于缩放因子，变换为y
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y)
@@ -43,10 +46,15 @@ def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, tor
             - The quantized tensor with dtype `torch.float8_e4m3fn`.
             - A tensor of scaling factors with dtype `torch.float32`.
     """
+    # 检查x是连续存储方式
     assert x.is_contiguous()
+    # 最后一维大小需要能被block_size整除, 也就是可以完整分块
     assert x.size(-1) % block_size == 0
+    # 创建一个与x形状相同的多维张量，用于存储量化后的结果
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    # 创建一个新的多维张量，形状是：只把最后一维缩小为 原大小/block_size，其它维数保持与x相同
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
+    # 计算线程块，多线程计算
     grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
     act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
     return y, s
